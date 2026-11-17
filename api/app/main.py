@@ -11,6 +11,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field, field_validator
 
+from .continuity import build_chain_view
 from .db import DB
 from .engine import FetchEngine
 from .extract import extract_document
@@ -52,7 +53,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Tender Corpus Collector",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Collect tender announcements from multiple official sites. "
         "Submit up to 20 announcement URLs per job; the collector extracts "
@@ -60,7 +61,15 @@ app = FastAPI(
         "globally, 1 per origin), per-origin cooldowns on 429/503 + "
         "Retry-After, max 3 redirect hops and max 2 retries per URL. "
         "The full JSON corpus is downloadable only when every announcement "
-        "of a job succeeded."
+        "of a job succeeded.\n\n"
+        "**Continuations:** register collected originals and corrections by "
+        "announcement id (`POST /api/continuations`). Chains are linear "
+        "(at most one predecessor and one active successor per announcement, "
+        "cycles rejected). `GET /api/corpus/effective` serves, per chain, the "
+        "last successfully collected item; if a correction is pending or "
+        "failed, the previous successful item is still served and the "
+        "pending/failure reason is reported. Existing job download endpoints "
+        "are unchanged."
     ),
     lifespan=lifespan,
 )
@@ -98,13 +107,16 @@ async def create_job(payload: JobCreate):
     engine: FetchEngine = app.state.engine
     job_id = uuid.uuid4().hex[:12]
     db.create_job(job_id, total=len(payload.urls))
+    announcements = []
     for url in payload.urls:
         ann_id = db.add_announcement(job_id, url)
         engine.submit(ann_id, url, hops=0, attempts=0)
+        announcements.append({"announcement_id": ann_id, "url": url})
     return {
         "job_id": job_id,
         "total": len(payload.urls),
         "status": "running",
+        "announcements": announcements,
         "progress_url": f"/jobs/{job_id}",
         "download_url": f"/jobs/{job_id}/download",
     }
@@ -214,3 +226,211 @@ async def cooldowns():
         if until > now
     ]
     return {"cooldowns": active}
+
+
+# ----------------------------------------------------------------------
+# Continuations: originals and corrections linked by announcement id.
+# ----------------------------------------------------------------------
+
+CONTINUATION_ERRORS = {
+    "unknown_announcement": (404, "one or both announcement ids do not exist"),
+    "original_not_collected": (
+        409, "the predecessor must already be collected successfully before it "
+             "can receive a correction"),
+    "announcement_already_has_predecessor": (
+        409, "this correction is already linked to a different predecessor; "
+             "a correction has at most one predecessor"),
+    "announcement_has_successor": (
+        409, "this announcement already has a successor and cannot be re-hung "
+             "elsewhere without splicing two chains"),
+    "previous_has_collected_successor": (
+        409, "the predecessor already has a successfully collected correction; "
+             "the chain is closed at that point"),
+    "previous_has_pending_successor": (
+        409, "the predecessor already has a correction that is still being "
+             "fetched; wait for it or let it fail before re-hanging"),
+    "cycle": (409, "registering this edge would create a cycle"),
+    "concurrent_conflict": (
+        409, "another registration modified this chain at the same time; retry"),
+}
+
+
+class ContinuationCreate(BaseModel):
+    announcement_id: int = Field(
+        gt=0, description="id of the correction (may still be fetching)")
+    previous_id: int = Field(
+        gt=0, description="id of the announcement this correction replaces "
+                          "(must already be collected successfully)")
+
+
+@app.post("/api/continuations", status_code=201,
+          summary="Register a correction as the continuation of an original")
+async def register_continuation(payload: ContinuationCreate):
+    """Link a correction to its predecessor.
+
+    The predecessor must already have been collected successfully; the
+    correction may still be pending/fetching. Each announcement may have at
+    most one predecessor and at most one active successor; cycles are
+    rejected. A correction whose fetch *failed* may be detached and replaced
+    by a newly registered correction.
+    """
+    code, extra = app.state.db.register_continuation(
+        payload.previous_id, payload.announcement_id)
+    if code is not None:
+        status, message = CONTINUATION_ERRORS.get(
+            code, (409, "continuation registration rejected"))
+        detail = {"error": code, "message": message}
+        if extra is not None:
+            detail["detail"] = extra
+        raise HTTPException(status_code=status, detail=detail)
+    return {
+        "status": "registered" if extra is None else extra,
+        "previous_id": payload.previous_id,
+        "announcement_id": payload.announcement_id,
+        "chain": _chain_view_for(payload.announcement_id),
+    }
+
+
+def _chain_view_for(ann_id: int):
+    snap = app.state.db.chain_snapshot(ann_id)
+    if snap is None:
+        return None
+    chain, detached = snap
+    return build_chain_view(chain, detached)
+
+
+@app.get("/api/announcements/{ann_id}",
+         summary="Inspect one announcement with its predecessor and successor")
+async def announcement_detail(ann_id: int):
+    db: DB = app.state.db
+    row = db.get_announcement(ann_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="announcement not found")
+    prev = db.predecessor_of(ann_id)
+    nxt = db.successor_of(ann_id)
+    detached = db.detached_edge_of(ann_id)
+    return {
+        "announcement_id": row["id"],
+        "job_id": row["job_id"],
+        "url": row["url"],
+        "final_url": row["current_url"],
+        "status": row["status"],
+        "hops": row["hops"],
+        "attempts": row["attempts"],
+        "title": row["title"],
+        "content": row["content"],
+        "error": row["error"],
+        "updated_at": row["updated_at"],
+        "previous_id": prev["id"] if prev else None,
+        "successor_id": nxt["id"] if nxt else None,
+        "detached_from_id": detached["previous_id"] if detached else None,
+        "detached_at": detached["detached_at"] if detached else None,
+        "detached_reason": detached["detached_reason"] if detached else None,
+    }
+
+
+@app.get("/api/announcements/{ann_id}/chain",
+         summary="Full continuation chain containing an announcement")
+async def announcement_chain(ann_id: int):
+    view = _chain_view_for(ann_id)
+    if view is None:
+        raise HTTPException(status_code=404, detail="announcement not found")
+    return view
+
+
+@app.get("/api/corpus/effective",
+         summary="Effective (currently usable) text for every continuation chain")
+async def effective_corpus(job_id: str | None = None, only_available: bool = False):
+    """Return one entry per chain with the effective document.
+
+    Policy: walk each chain root -> tail and pick the LAST successfully
+    collected item.  If the newest correction is still being fetched or its
+    fetch failed, the previous successful item stays effective and the
+    pending/failure reason is included.  Documents from untracked chains
+    (never collected successfully) are reported with `available: false`.
+    """
+    db: DB = app.state.db
+    if job_id is not None and db.get_job(job_id) is None:
+        raise HTTPException(status_code=404, detail="job not found")
+
+    # One consistent read of every active chain: a concurrent registration is
+    # seen either fully or not at all, so no chain appears twice and no chain
+    # briefly disappears.
+    snapshots = db.corpus_snapshot(job_id)
+
+    entries, counts = [], Counter()
+    for chain, detached in snapshots:
+        view = build_chain_view(chain, detached)
+        if view is None:
+            continue
+        counts[view["state"]] += 1
+        if only_available and not view["available"]:
+            continue
+        entries.append({
+            "chain_root_id": view["chain_root_id"],
+            "chain_length": view["chain_length"],
+            "correction_count": view["correction_count"],
+            "state": view["state"],
+            "available": view["available"],
+            "effective_announcement_id": view["effective_announcement_id"],
+            "tail_announcement_id": view["tail_announcement_id"],
+            "tail_status": view["tail_status"],
+            "pending_reason": view["pending_reason"],
+            "failed_reason": view["failed_reason"],
+            "replaced_corrections": view["replaced_corrections"],
+            "document": view["effective"],
+        })
+
+    return {
+        "generated_at": time.time(),
+        "job_id": job_id,
+        "entry_count": len(entries),
+        "states": {
+            "current": counts["current"],
+            "pending": counts["pending"],
+            "failed": counts["failed"],
+        },
+        "entries": entries,
+    }
+
+
+@app.get("/api/corpus/effective/download",
+         summary="Download the effective corpus as JSON (one document per chain)")
+async def download_effective_corpus(job_id: str | None = None,
+                                    require_all_available: bool = False):
+    """Download the effective corpus as a JSON attachment.
+
+    By default chains without a successfully collected version are included
+    with `document: null` and their reason; pass `require_all_available=true`
+    to get 409 instead when any chain has no usable text.
+    """
+    body = await effective_corpus(job_id=job_id, only_available=False)
+    unavailable = [e for e in body["entries"] if not e["available"]]
+    if require_all_available and unavailable:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "corpus_incomplete",
+                "message": "some continuation chains have no successfully "
+                           "collected document",
+                "unavailable_chain_root_ids":
+                    [e["chain_root_id"] for e in unavailable],
+            },
+        )
+    documents = [e["document"] for e in body["entries"] if e["document"] is not None]
+    payload = {
+        "generated_at": body["generated_at"],
+        "job_id": job_id,
+        "document_count": len(documents),
+        "unavailable_count": len(unavailable),
+        "states": body["states"],
+        "documents": documents,
+        "chains": body["entries"],
+    }
+    suffix = f"-{job_id}" if job_id else ""
+    return JSONResponse(
+        content=payload,
+        headers={"Content-Disposition":
+                 f'attachment; filename="effective-corpus{suffix}.json"'},
+    )
+
